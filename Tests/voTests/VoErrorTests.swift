@@ -93,4 +93,64 @@ struct VoErrorTests {
         #expect(msg.contains("corrupt"))
         #expect(msg.contains("I/O error"))
     }
+
+    /// A device caught mid-switch names the channel and the format it reported, and says
+    /// the condition is transient, so the user retries instead of hunting for a setting.
+    @Test func audioDeviceNotReadyNamesChannelAndFormat() {
+        let err = VoError.audioDeviceNotReady(channel: .mic, format: "2 ch, 44100 Hz, Float32")
+        let msg = err.description
+
+        #expect(msg.contains("microphone input device"))
+        #expect(msg.contains("2 ch, 44100 Hz, Float32"))
+        #expect(msg.contains("Retry"))
+    }
+
+    /// The reason attached to a stderr notice has to be the error's own actionable text.
+    /// VoError and CoreAudioError conform to no Foundation error protocol, so
+    /// localizedDescription would replace it with NSError's generic wording.
+    @Test func describeErrorPrefersTheTypesOwnDescription() {
+        let vo = VoError.audioDeviceNotReady(channel: .mic, format: "0 ch, 0 Hz")
+        #expect(describeError(vo) == vo.description)
+        #expect(!describeError(vo).contains("operation couldn"))
+
+        let coreAudio = CoreAudioError(code: -50, op: "DeviceStart")
+        #expect(describeError(coreAudio) == coreAudio.description)
+
+        // An error that does carry a localized message keeps it.
+        let cocoa = NSError(
+            domain: NSCocoaErrorDomain,
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Device busy"]
+        )
+        #expect(describeError(cocoa) == "Device busy")
+    }
+
+    /// A stderr notice carries one event per line, so a multi-line reason has to collapse
+    /// before it is embedded in one. `audioDeviceNotReady`, the likeliest reason a reopen
+    /// keeps failing, is exactly such a description.
+    @Test func singleLineCollapsesAMultiLineDescription() {
+        let err = VoError.audioDeviceNotReady(channel: .mic, format: "0 ch, 0 Hz")
+        #expect(err.description.contains("\n"))
+
+        let flattened = singleLine(err.description)
+        #expect(!flattened.contains("\n"))
+        #expect(flattened.contains("is not ready yet"))
+        #expect(flattened.contains("Retry in a moment."))
+        #expect(!flattened.contains("  "))
+    }
+
+    /// A tap install that failed carries the framework's own reason, which is the only
+    /// thing distinguishing a format mismatch from a permission or device error.
+    @Test func audioTapInstallFailedIncludesUnderlying() {
+        let underlying = NSError(
+            domain: "com.apple.coreaudio.avfaudio",
+            code: 0,
+            userInfo: [NSLocalizedDescriptionKey: "Failed to create tap due to format mismatch"]
+        )
+        let err = VoError.audioTapInstallFailed(channel: .mic, underlying: underlying)
+        let msg = err.description
+
+        #expect(msg.contains("microphone input device"))
+        #expect(msg.contains("format mismatch"))
+    }
 }

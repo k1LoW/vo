@@ -997,7 +997,7 @@ struct Pipeline {
                     // to no samples and is skipped, so a contiguous stream injects nothing.
                     // Each analyzer needs its own AnalyzerInput so they iterate the same
                     // PCM buffer independently.
-                    if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                    await feedSilence(seconds: h - reference, format: analyzerFormat) { silence in
                         for b in inputBuilders { b.yield(AnalyzerInput(buffer: silence)) }
                     }
                     // Advance the fed position past h only by audio actually fed. If the
@@ -1017,17 +1017,10 @@ struct Pipeline {
                 // the catch-path cleanup calls resampler.cancel() before the box is
                 // marked stopped, leaving a window where shouldRebind would still be true.
                 guard !Task.isCancelled, rebind.shouldRebind() else { break }
-                do {
-                    stream = try await makeCapture()
-                    // The new stream's first buffer bridges the reopen gap from
-                    // fedEndHostTime automatically, so no extra state is needed here.
-                    emitProgress("vo: the \(channel.deviceDescription) changed. Following the new default.")
-                } catch is CancellationError {
-                    break
-                } catch {
-                    emitProgress("vo: the \(channel.deviceDescription) changed but the new default could not be opened. Stopping this channel.")
-                    break
-                }
+                // The new stream's first buffer bridges the reopen gap from
+                // fedEndHostTime automatically, so no extra state is needed here.
+                guard let reopened = await reopenCapture(channel: channel, makeCapture: makeCapture) else { break }
+                stream = reopened
             }
             for b in inputBuilders { b.finish() }
         }
@@ -1242,7 +1235,7 @@ struct Pipeline {
                 guard let timed else { break }
                 let reference = fedEndHostTime ?? sessionStart
                 let h = max(timed.hostTime, reference)
-                if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                await feedSilence(seconds: h - reference, format: analyzerFormat) { silence in
                     for buf in inputBuffers { await buf.send(AnalyzerInput(buffer: silence)) }
                 }
                 if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
@@ -1429,6 +1422,88 @@ struct Pipeline {
     }
 }
 
+/// How many times a channel tries to reopen its capture after the default device changed
+/// before it gives up and ends. With the backoff below this spans roughly ten minutes,
+/// which covers a headset that stays busy for a good part of a meeting while still
+/// terminating rather than retrying forever.
+let maxReopenAttempts = 120
+private let reopenBackoffBase = Duration.milliseconds(250)
+private let reopenBackoffCap = Duration.seconds(5)
+
+/// Delay before reopen attempt `attempt`, counted from 0 for the attempt that runs as soon
+/// as the device change is seen. Doubles per failure up to `reopenBackoffCap`, so a device
+/// that comes back immediately is picked up immediately, and one that is contended (a
+/// conferencing app holding the headset profile) is not hammered for minutes.
+func reopenBackoffDelay(attempt: Int) -> Duration {
+    guard attempt > 0 else { return .zero }
+    // Cap the shift before it is applied, not the product: 1 << 120 is undefined,
+    // and the capped delay is reached long before the exponent gets large anyway.
+    let doublings = min(attempt - 1, 16)
+    let delay = reopenBackoffBase * (1 << doublings)
+    return min(delay, reopenBackoffCap)
+}
+
+/// Rebuild a channel's capture on the new default device, retrying while the device
+/// refuses to open. A Bluetooth profile switch leaves the device unopenable (or reporting
+/// a format that would make the tap install fail) for seconds at a time, and giving up on
+/// the first refusal silently drops that channel for the rest of the session while vo
+/// still looks healthy. Returns nil when the channel should end.
+private func reopenCapture(
+    channel: AudioChannel,
+    makeCapture: @escaping @Sendable () async throws -> AsyncStream<TimedBuffer>
+) async -> AsyncStream<TimedBuffer>? {
+    var lastError: Error?
+    for attempt in 0..<maxReopenAttempts {
+        let delay = reopenBackoffDelay(attempt: attempt)
+        if delay > .zero {
+            do { try await Task.sleep(for: delay) } catch { return nil }
+        }
+        if Task.isCancelled { return nil }
+        do {
+            let stream = try await makeCapture()
+            if attempt == 0 {
+                emitProgress("vo: the \(channel.deviceDescription) changed. Following the new default.")
+            } else {
+                emitProgress("vo: the \(channel.deviceDescription) is back. Following the new default.")
+            }
+            return stream
+        } catch is CancellationError {
+            return nil
+        } catch {
+            // One notice per outage, not per attempt, so a long retry streak does not
+            // bury the transcript's own stderr output.
+            if attempt == 0 {
+                emitProgress("vo: the \(channel.deviceDescription) changed but the new default could not be opened yet. Retrying…")
+            }
+            lastError = error
+        }
+    }
+    // Flattened because a VoError description spans several lines, and this notice shares
+    // stderr with a JSONL consumer's own logging, where one event has to stay one line.
+    let reason = lastError.map { " (\(singleLine(describeError($0))))" } ?? ""
+    emitProgress("vo: the \(channel.deviceDescription) could not be reopened after \(maxReopenAttempts) attempts\(reason). Stopping this channel.")
+    return nil
+}
+
+/// Render an `Error` for the user. `VoError` and `CoreAudioError` carry their actionable
+/// text in `description` and conform to no error protocol Foundation knows about, so
+/// `localizedDescription` would flatten exactly the reason we want to show into NSError's
+/// "The operation couldn't be completed." Mirrors `describe` in `SessionLog.swift`.
+func describeError(_ error: Error) -> String {
+    switch error {
+    case let e as VoError: return e.description
+    case let e as CoreAudioError: return e.description
+    default: return error.localizedDescription
+    }
+}
+
+/// Collapse a multi-line message into one line, for the stderr notices that are read as
+/// one event per line. The multi-line form stays the right shape where the message is the
+/// whole output (a startup failure), so it is flattened at the notice, not at the source.
+func singleLine(_ text: String) -> String {
+    text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+}
+
 /// Write a one-line status to stderr. Stays off stdout so it never corrupts the
 /// JSONL stream a downstream reader may be consuming.
 private func emitProgress(_ message: String) {
@@ -1472,16 +1547,51 @@ func hostTimeNowSeconds() -> Double {
     AVAudioTime.seconds(forHostTime: mach_absolute_time())
 }
 
-/// Build `seconds` of silence in `format`, used to bridge a device-rebind reopen gap (and
+/// Longest span of bridging silence carried by a single PCM buffer. A reopen keeps a
+/// channel dark for as long as `maxReopenAttempts` allows, and sizing one buffer to the
+/// whole outage would turn a multi-minute one into a multi-megabyte allocation that the
+/// analyzer then has to chew through in a single step before it reaches live audio.
+private let silenceChunkSeconds = 1.0
+
+/// Bridge `seconds` of silence by handing `feed` one buffer at a time, none longer than
+/// `silenceChunkSeconds`. The total frame count is rounded once, up front, so splitting
+/// the span cannot drift the analyzer's timeline the way per-chunk rounding would. The
+/// full-length chunk is allocated once and reused across iterations, which is safe
+/// because nothing mutates a buffer after it is filled.
+/// A non-positive, non-finite, or unrepresentable duration feeds nothing, in which case
+/// the caller leaves the timeline unadjusted for that span.
+func feedSilence(
+    seconds: Double,
+    format: AVAudioFormat,
+    _ feed: (AVAudioPCMBuffer) async -> Void
+) async {
+    guard seconds > 0, seconds.isFinite, format.sampleRate > 0 else { return }
+    let totalFrames = (seconds * format.sampleRate).rounded()
+    guard totalFrames >= 1, totalFrames <= Double(AVAudioFrameCount.max) else { return }
+
+    var remaining = AVAudioFrameCount(totalFrames)
+    let chunkFrames = AVAudioFrameCount(max(1, (silenceChunkSeconds * format.sampleRate).rounded()))
+    var fullChunk: AVAudioPCMBuffer?
+    while remaining > 0 {
+        let frames = min(chunkFrames, remaining)
+        let buffer: AVAudioPCMBuffer?
+        if frames == chunkFrames {
+            if fullChunk == nil { fullChunk = makeSilentBuffer(frames: chunkFrames, format: format) }
+            buffer = fullChunk
+        } else {
+            buffer = makeSilentBuffer(frames: frames, format: format)
+        }
+        guard let buffer else { return }
+        await feed(buffer)
+        remaining -= frames
+    }
+}
+
+/// Build `frames` of silence in `format`, used to bridge a device-rebind reopen gap (and
 /// the initial offset from sessionStart) so the analyzer's sample timeline stays aligned
 /// with host time (the shared session axis).
-/// Returns nil for a non-positive, non-finite, or unrepresentable duration, in which case
-/// the caller skips that span and leaves the timeline unadjusted for it.
-private func makeSilentBuffer(seconds: Double, format: AVAudioFormat) -> AVAudioPCMBuffer? {
-    guard seconds > 0, seconds.isFinite else { return nil }
-    let frameCount = (seconds * format.sampleRate).rounded()
-    guard frameCount >= 1, frameCount <= Double(AVAudioFrameCount.max) else { return nil }
-    let frames = AVAudioFrameCount(frameCount)
+private func makeSilentBuffer(frames: AVAudioFrameCount, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+    guard frames >= 1 else { return nil }
     guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
     buffer.frameLength = frames
     // AVAudioPCMBuffer does not document its allocation as zero-filled, so make the
@@ -1528,11 +1638,23 @@ enum VoError: Error, CustomStringConvertible {
     case unsupportedTranslationPair(source: Locale, target: Locale)
     case inputFileOpenFailed(url: URL, underlying: Error)
     case inputFileReadFailed(url: URL, underlying: Error)
+    case audioDeviceNotReady(channel: AudioChannel, format: String)
+    case audioTapInstallFailed(channel: AudioChannel, underlying: Error)
 
     var description: String {
         switch self {
         case .noCompatibleAudioFormat:
             return "No audio format compatible with SpeechTranscriber is available on this device."
+
+        case .audioDeviceNotReady(let channel, let format):
+            return """
+            The \(channel.deviceDescription) is not ready yet (it reports \(format)).
+            It is probably still switching format, which Bluetooth headsets do when they
+            move between their playback and headset profiles. Retry in a moment.
+            """
+
+        case .audioTapInstallFailed(let channel, let underlying):
+            return "Could not start capturing from the \(channel.deviceDescription): \(underlying.localizedDescription)"
 
         case .inputFileOpenFailed(let url, let underlying):
             let path = url.isFileURL ? url.path : url.absoluteString
