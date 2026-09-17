@@ -997,7 +997,7 @@ struct Pipeline {
                     // to no samples and is skipped, so a contiguous stream injects nothing.
                     // Each analyzer needs its own AnalyzerInput so they iterate the same
                     // PCM buffer independently.
-                    if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                    await feedSilence(seconds: h - reference, format: analyzerFormat) { silence in
                         for b in inputBuilders { b.yield(AnalyzerInput(buffer: silence)) }
                     }
                     // Advance the fed position past h only by audio actually fed. If the
@@ -1235,7 +1235,7 @@ struct Pipeline {
                 guard let timed else { break }
                 let reference = fedEndHostTime ?? sessionStart
                 let h = max(timed.hostTime, reference)
-                if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                await feedSilence(seconds: h - reference, format: analyzerFormat) { silence in
                     for buf in inputBuffers { await buf.send(AnalyzerInput(buffer: silence)) }
                 }
                 if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
@@ -1538,16 +1538,51 @@ func hostTimeNowSeconds() -> Double {
     AVAudioTime.seconds(forHostTime: mach_absolute_time())
 }
 
-/// Build `seconds` of silence in `format`, used to bridge a device-rebind reopen gap (and
+/// Longest span of bridging silence carried by a single PCM buffer. A reopen keeps a
+/// channel dark for as long as `maxReopenAttempts` allows, and sizing one buffer to the
+/// whole outage would turn a multi-minute one into a multi-megabyte allocation that the
+/// analyzer then has to chew through in a single step before it reaches live audio.
+private let silenceChunkSeconds = 1.0
+
+/// Bridge `seconds` of silence by handing `feed` one buffer at a time, none longer than
+/// `silenceChunkSeconds`. The total frame count is rounded once, up front, so splitting
+/// the span cannot drift the analyzer's timeline the way per-chunk rounding would. The
+/// full-length chunk is allocated once and reused across iterations, which is safe
+/// because nothing mutates a buffer after it is filled.
+/// A non-positive, non-finite, or unrepresentable duration feeds nothing, in which case
+/// the caller leaves the timeline unadjusted for that span.
+func feedSilence(
+    seconds: Double,
+    format: AVAudioFormat,
+    _ feed: (AVAudioPCMBuffer) async -> Void
+) async {
+    guard seconds > 0, seconds.isFinite, format.sampleRate > 0 else { return }
+    let totalFrames = (seconds * format.sampleRate).rounded()
+    guard totalFrames >= 1, totalFrames <= Double(AVAudioFrameCount.max) else { return }
+
+    var remaining = AVAudioFrameCount(totalFrames)
+    let chunkFrames = AVAudioFrameCount(max(1, (silenceChunkSeconds * format.sampleRate).rounded()))
+    var fullChunk: AVAudioPCMBuffer?
+    while remaining > 0 {
+        let frames = min(chunkFrames, remaining)
+        let buffer: AVAudioPCMBuffer?
+        if frames == chunkFrames {
+            if fullChunk == nil { fullChunk = makeSilentBuffer(frames: chunkFrames, format: format) }
+            buffer = fullChunk
+        } else {
+            buffer = makeSilentBuffer(frames: frames, format: format)
+        }
+        guard let buffer else { return }
+        await feed(buffer)
+        remaining -= frames
+    }
+}
+
+/// Build `frames` of silence in `format`, used to bridge a device-rebind reopen gap (and
 /// the initial offset from sessionStart) so the analyzer's sample timeline stays aligned
 /// with host time (the shared session axis).
-/// Returns nil for a non-positive, non-finite, or unrepresentable duration, in which case
-/// the caller skips that span and leaves the timeline unadjusted for it.
-private func makeSilentBuffer(seconds: Double, format: AVAudioFormat) -> AVAudioPCMBuffer? {
-    guard seconds > 0, seconds.isFinite else { return nil }
-    let frameCount = (seconds * format.sampleRate).rounded()
-    guard frameCount >= 1, frameCount <= Double(AVAudioFrameCount.max) else { return nil }
-    let frames = AVAudioFrameCount(frameCount)
+private func makeSilentBuffer(frames: AVAudioFrameCount, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+    guard frames >= 1 else { return nil }
     guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
     buffer.frameLength = frames
     // AVAudioPCMBuffer does not document its allocation as zero-filled, so make the
