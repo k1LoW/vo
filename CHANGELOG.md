@@ -1,5 +1,12 @@
 # Changelog
 
+## [v0.9.1](https://github.com/k1LoW/vo/compare/v0.9.0...v0.9.1) - 2026-09-17
+
+### Fix bug 🐛
+- fix: keep capturing across a Bluetooth device switch by @k1LoW in https://github.com/k1LoW/vo/pull/48
+### Dependency Updates ⬆️
+- chore(deps): bump the dependencies group with 2 updates by @dependabot[bot] in https://github.com/k1LoW/vo/pull/44
+
 ## [v0.9.0](https://github.com/k1LoW/vo/compare/v0.8.1...v0.9.0) - 2026-06-26
 
 ### New Features 🎉
