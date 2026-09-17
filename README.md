@@ -103,7 +103,7 @@ $ vo --src ja-JP --dst en-US --no-speaker --json \
 
 ### Device selection
 
-By default `vo` captures from the system default microphone and output device and follows them. If the default input or output changes mid-session (you switch output, or plug in headphones), `vo` rebuilds that channel on the new default and keeps going instead of stopping.
+By default `vo` captures from the system default microphone and output device and follows them. If the default input or output changes mid-session (you switch output, or plug in headphones), `vo` rebuilds that channel on the new default and keeps going instead of stopping. A device that is not ready yet is retried with a backoff for several minutes, since a Bluetooth headset can stay busy for seconds while it switches between its playback and headset profiles.
 
 `--select-device` instead prompts you to pick the mic and speaker device at startup and pins the choice, so a later system-default change is ignored and the chosen device stays in use. The picker writes its menu to stderr and reads your choice from stdin, so `vo --select-device --json > out.jsonl` keeps stdout pure JSONL while you select. It needs a terminal for stdin and stderr, so it errors out when stdin is piped.
 
