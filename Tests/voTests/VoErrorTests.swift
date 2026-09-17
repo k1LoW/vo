@@ -93,4 +93,30 @@ struct VoErrorTests {
         #expect(msg.contains("corrupt"))
         #expect(msg.contains("I/O error"))
     }
+
+    /// A device caught mid-switch names the channel and the format it reported, and says
+    /// the condition is transient, so the user retries instead of hunting for a setting.
+    @Test func audioDeviceNotReadyNamesChannelAndFormat() {
+        let err = VoError.audioDeviceNotReady(channel: .mic, format: "2 ch, 44100 Hz, Float32")
+        let msg = err.description
+
+        #expect(msg.contains("microphone input device"))
+        #expect(msg.contains("2 ch, 44100 Hz, Float32"))
+        #expect(msg.contains("Retry"))
+    }
+
+    /// A tap install that failed carries the framework's own reason, which is the only
+    /// thing distinguishing a format mismatch from a permission or device error.
+    @Test func audioTapInstallFailedIncludesUnderlying() {
+        let underlying = NSError(
+            domain: "com.apple.coreaudio.avfaudio",
+            code: 0,
+            userInfo: [NSLocalizedDescriptionKey: "Failed to create tap due to format mismatch"]
+        )
+        let err = VoError.audioTapInstallFailed(channel: .mic, underlying: underlying)
+        let msg = err.description
+
+        #expect(msg.contains("microphone input device"))
+        #expect(msg.contains("format mismatch"))
+    }
 }

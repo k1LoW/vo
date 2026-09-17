@@ -13,16 +13,23 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0")
     ],
     targets: [
+        // Objective-C only because Swift cannot catch an NSException, which AVFAudio
+        // raises on a tap format mismatch. See Sources/VoObjC/include/VoObjC.h.
+        .target(
+            name: "VoObjC",
+            path: "Sources/VoObjC"
+        ),
         .executableTarget(
             name: "vo",
             dependencies: [
-                .product(name: "ArgumentParser", package: "swift-argument-parser")
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                "VoObjC"
             ],
             path: "Sources/vo"
         ),
         .testTarget(
             name: "voTests",
-            dependencies: ["vo"],
+            dependencies: ["vo", "VoObjC"],
             path: "Tests/voTests"
         )
     ]

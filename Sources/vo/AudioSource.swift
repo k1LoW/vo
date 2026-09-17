@@ -105,16 +105,32 @@ final class MicCapture: @unchecked Sendable {
             try Self.setInputDevice(deviceID, on: inputNode)
         }
 
+        // A device caught mid-switch (a Bluetooth headset moving between A2DP and HFP
+        // above all) reports a placeholder format here that no longer describes the
+        // hardware, and installTap answers that by *raising* rather than returning:
+        // an NSException no Swift catch can see, which aborts the process mid-session.
+        // So reject the obvious placeholder up front and route the install itself
+        // through the Objective-C bridge, leaving the caller free to retry once the
+        // device settles.
         let inputFormat = inputNode.outputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw VoError.audioDeviceNotReady(channel: .mic, format: "\(inputFormat)")
+        }
         let builder = self.builder
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, when in
-            // Copy the buffer because installTap reuses the underlying storage.
-            guard let copy = buffer.copy() else { return }
-            // Forward the tap's host time so the pipeline can place this buffer on the
-            // shared session axis. AVAudioTime carries it when isHostTimeValid; fall back to
-            // the current host time otherwise so the value is always present.
-            let hostTime = when.isHostTimeValid ? AVAudioTime.seconds(forHostTime: when.hostTime) : hostTimeNowSeconds()
-            builder.yield(TimedBuffer(buffer: copy, hostTime: hostTime))
+        do {
+            try catchingNSException {
+                inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, when in
+                    // Copy the buffer because installTap reuses the underlying storage.
+                    guard let copy = buffer.copy() else { return }
+                    // Forward the tap's host time so the pipeline can place this buffer on the
+                    // shared session axis. AVAudioTime carries it when isHostTimeValid; fall back to
+                    // the current host time otherwise so the value is always present.
+                    let hostTime = when.isHostTimeValid ? AVAudioTime.seconds(forHostTime: when.hostTime) : hostTimeNowSeconds()
+                    builder.yield(TimedBuffer(buffer: copy, hostTime: hostTime))
+                }
+            }
+        } catch {
+            throw VoError.audioTapInstallFailed(channel: .mic, underlying: error)
         }
         try engine.start()
 

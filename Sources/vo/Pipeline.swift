@@ -1528,11 +1528,23 @@ enum VoError: Error, CustomStringConvertible {
     case unsupportedTranslationPair(source: Locale, target: Locale)
     case inputFileOpenFailed(url: URL, underlying: Error)
     case inputFileReadFailed(url: URL, underlying: Error)
+    case audioDeviceNotReady(channel: AudioChannel, format: String)
+    case audioTapInstallFailed(channel: AudioChannel, underlying: Error)
 
     var description: String {
         switch self {
         case .noCompatibleAudioFormat:
             return "No audio format compatible with SpeechTranscriber is available on this device."
+
+        case .audioDeviceNotReady(let channel, let format):
+            return """
+            The \(channel.deviceDescription) is not ready yet (it reports \(format)).
+            It is probably still switching format, which Bluetooth headsets do when they
+            move between their playback and headset profiles. Retry in a moment.
+            """
+
+        case .audioTapInstallFailed(let channel, let underlying):
+            return "Could not start capturing from the \(channel.deviceDescription): \(underlying.localizedDescription)"
 
         case .inputFileOpenFailed(let url, let underlying):
             let path = url.isFileURL ? url.path : url.absoluteString
