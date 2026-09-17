@@ -125,6 +125,20 @@ struct VoErrorTests {
         #expect(describeError(cocoa) == "Device busy")
     }
 
+    /// A stderr notice carries one event per line, so a multi-line reason has to collapse
+    /// before it is embedded in one — and `audioDeviceNotReady`, the likeliest reason a
+    /// reopen keeps failing, is exactly such a description.
+    @Test func singleLineCollapsesAMultiLineDescription() {
+        let err = VoError.audioDeviceNotReady(channel: .mic, format: "0 ch, 0 Hz")
+        #expect(err.description.contains("\n"))
+
+        let flattened = singleLine(err.description)
+        #expect(!flattened.contains("\n"))
+        #expect(flattened.contains("is not ready yet"))
+        #expect(flattened.contains("Retry in a moment."))
+        #expect(!flattened.contains("  "))
+    }
+
     /// A tap install that failed carries the framework's own reason, which is the only
     /// thing distinguishing a format mismatch from a permission or device error.
     @Test func audioTapInstallFailedIncludesUnderlying() {

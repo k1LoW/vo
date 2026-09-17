@@ -1422,8 +1422,6 @@ struct Pipeline {
     }
 }
 
-/// Write a one-line status to stderr. Stays off stdout so it never corrupts the
-/// JSONL stream a downstream reader may be consuming.
 /// How many times a channel tries to reopen its capture after the default device changed
 /// before it gives up and ends. With the backoff below this spans roughly ten minutes,
 /// which covers a headset that stays busy for a good part of a meeting while still
@@ -1480,7 +1478,9 @@ private func reopenCapture(
             lastError = error
         }
     }
-    let reason = lastError.map { " (\(describeError($0)))" } ?? ""
+    // Flattened because a VoError description spans several lines, and this notice shares
+    // stderr with a JSONL consumer's own logging, where one event has to stay one line.
+    let reason = lastError.map { " (\(singleLine(describeError($0))))" } ?? ""
     emitProgress("vo: the \(channel.deviceDescription) could not be reopened after \(maxReopenAttempts) attempts\(reason). Stopping this channel.")
     return nil
 }
@@ -1497,6 +1497,15 @@ func describeError(_ error: Error) -> String {
     }
 }
 
+/// Collapse a multi-line message into one line, for the stderr notices that are read as
+/// one event per line. The multi-line form stays the right shape where the message is the
+/// whole output (a startup failure), so it is flattened at the notice, not at the source.
+func singleLine(_ text: String) -> String {
+    text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+}
+
+/// Write a one-line status to stderr. Stays off stdout so it never corrupts the
+/// JSONL stream a downstream reader may be consuming.
 private func emitProgress(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
 }
