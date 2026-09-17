@@ -1480,9 +1480,21 @@ private func reopenCapture(
             lastError = error
         }
     }
-    let reason = lastError.map { " (\($0.localizedDescription))" } ?? ""
+    let reason = lastError.map { " (\(describeError($0)))" } ?? ""
     emitProgress("vo: the \(channel.deviceDescription) could not be reopened after \(maxReopenAttempts) attempts\(reason). Stopping this channel.")
     return nil
+}
+
+/// Render an `Error` for the user. `VoError` and `CoreAudioError` carry their actionable
+/// text in `description` and conform to no error protocol Foundation knows about, so
+/// `localizedDescription` would flatten exactly the reason we want to show into NSError's
+/// "The operation couldn't be completed." Mirrors `describe` in `SessionLog.swift`.
+func describeError(_ error: Error) -> String {
+    switch error {
+    case let e as VoError: return e.description
+    case let e as CoreAudioError: return e.description
+    default: return error.localizedDescription
+    }
 }
 
 private func emitProgress(_ message: String) {

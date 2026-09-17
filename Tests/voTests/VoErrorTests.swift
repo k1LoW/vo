@@ -105,6 +105,26 @@ struct VoErrorTests {
         #expect(msg.contains("Retry"))
     }
 
+    /// The reason attached to a stderr notice has to be the error's own actionable text.
+    /// VoError and CoreAudioError conform to no Foundation error protocol, so
+    /// localizedDescription would replace it with NSError's generic wording.
+    @Test func describeErrorPrefersTheTypesOwnDescription() {
+        let vo = VoError.audioDeviceNotReady(channel: .mic, format: "0 ch, 0 Hz")
+        #expect(describeError(vo) == vo.description)
+        #expect(!describeError(vo).contains("operation couldn"))
+
+        let coreAudio = CoreAudioError(code: -50, op: "DeviceStart")
+        #expect(describeError(coreAudio) == coreAudio.description)
+
+        // An error that does carry a localized message keeps it.
+        let cocoa = NSError(
+            domain: NSCocoaErrorDomain,
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Device busy"]
+        )
+        #expect(describeError(cocoa) == "Device busy")
+    }
+
     /// A tap install that failed carries the framework's own reason, which is the only
     /// thing distinguishing a format mismatch from a permission or device error.
     @Test func audioTapInstallFailedIncludesUnderlying() {
