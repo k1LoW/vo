@@ -1017,17 +1017,10 @@ struct Pipeline {
                 // the catch-path cleanup calls resampler.cancel() before the box is
                 // marked stopped, leaving a window where shouldRebind would still be true.
                 guard !Task.isCancelled, rebind.shouldRebind() else { break }
-                do {
-                    stream = try await makeCapture()
-                    // The new stream's first buffer bridges the reopen gap from
-                    // fedEndHostTime automatically, so no extra state is needed here.
-                    emitProgress("vo: the \(channel.deviceDescription) changed. Following the new default.")
-                } catch is CancellationError {
-                    break
-                } catch {
-                    emitProgress("vo: the \(channel.deviceDescription) changed but the new default could not be opened. Stopping this channel.")
-                    break
-                }
+                // The new stream's first buffer bridges the reopen gap from
+                // fedEndHostTime automatically, so no extra state is needed here.
+                guard let reopened = await reopenCapture(channel: channel, makeCapture: makeCapture) else { break }
+                stream = reopened
             }
             for b in inputBuilders { b.finish() }
         }
@@ -1431,6 +1424,67 @@ struct Pipeline {
 
 /// Write a one-line status to stderr. Stays off stdout so it never corrupts the
 /// JSONL stream a downstream reader may be consuming.
+/// How many times a channel tries to reopen its capture after the default device changed
+/// before it gives up and ends. With the backoff below this spans roughly ten minutes,
+/// which covers a headset that stays busy for a good part of a meeting while still
+/// terminating rather than retrying forever.
+let maxReopenAttempts = 120
+private let reopenBackoffBase = Duration.milliseconds(250)
+private let reopenBackoffCap = Duration.seconds(5)
+
+/// Delay before reopen attempt `attempt`, counted from 0 for the attempt that runs as soon
+/// as the device change is seen. Doubles per failure up to `reopenBackoffCap`, so a device
+/// that comes back immediately is picked up immediately, and one that is contended (a
+/// conferencing app holding the headset profile) is not hammered for minutes.
+func reopenBackoffDelay(attempt: Int) -> Duration {
+    guard attempt > 0 else { return .zero }
+    // Cap the shift before it is applied, not the product: 1 << 120 is undefined,
+    // and the capped delay is reached long before the exponent gets large anyway.
+    let doublings = min(attempt - 1, 16)
+    let delay = reopenBackoffBase * (1 << doublings)
+    return min(delay, reopenBackoffCap)
+}
+
+/// Rebuild a channel's capture on the new default device, retrying while the device
+/// refuses to open. A Bluetooth profile switch leaves the device unopenable (or reporting
+/// a format that would make the tap install fail) for seconds at a time, and giving up on
+/// the first refusal silently drops that channel for the rest of the session while vo
+/// still looks healthy. Returns nil when the channel should end.
+private func reopenCapture(
+    channel: AudioChannel,
+    makeCapture: @escaping @Sendable () async throws -> AsyncStream<TimedBuffer>
+) async -> AsyncStream<TimedBuffer>? {
+    var lastError: Error?
+    for attempt in 0..<maxReopenAttempts {
+        let delay = reopenBackoffDelay(attempt: attempt)
+        if delay > .zero {
+            do { try await Task.sleep(for: delay) } catch { return nil }
+        }
+        if Task.isCancelled { return nil }
+        do {
+            let stream = try await makeCapture()
+            if attempt == 0 {
+                emitProgress("vo: the \(channel.deviceDescription) changed. Following the new default.")
+            } else {
+                emitProgress("vo: the \(channel.deviceDescription) is back. Following the new default.")
+            }
+            return stream
+        } catch is CancellationError {
+            return nil
+        } catch {
+            // One notice per outage, not per attempt, so a long retry streak does not
+            // bury the transcript's own stderr output.
+            if attempt == 0 {
+                emitProgress("vo: the \(channel.deviceDescription) changed but the new default could not be opened yet. Retrying…")
+            }
+            lastError = error
+        }
+    }
+    let reason = lastError.map { " (\($0.localizedDescription))" } ?? ""
+    emitProgress("vo: the \(channel.deviceDescription) could not be reopened after \(maxReopenAttempts) attempts\(reason). Stopping this channel.")
+    return nil
+}
+
 private func emitProgress(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
 }
