@@ -32,7 +32,7 @@ let maxTranslationStallAttempts = 2
 
 /// Feeds finalized chunks to a translation backend with exactly one call in flight.
 ///
-/// Why one call: overlapping `translate(_:)` calls on a shared `TranslationSession`
+/// Only one, because overlapping `translate(_:)` calls on a shared `TranslationSession`
 /// are not documented as safe, and a live session was observed to stop answering
 /// for good while four were in flight. Throughput comes from batching instead.
 /// Whatever queued up while the previous call ran goes out together in the next, so
