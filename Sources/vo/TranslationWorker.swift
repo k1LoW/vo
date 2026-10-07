@@ -179,7 +179,6 @@ struct TranslationWorker: Sendable {
         let consumer = Task {
             do {
                 for try await result in backend.translate(batch) {
-                    await progress.bump()
                     cont.yield(.result(result))
                 }
                 cont.yield(.done)
@@ -208,8 +207,11 @@ struct TranslationWorker: Sendable {
             case .result(let result):
                 // Results for seqs this batch no longer owns (a duplicate, or a stray
                 // id) are dropped so a chunk is never committed twice.
+                // They also leave the deadline alone, so a backend emitting only
+                // strays is still caught as a stall.
                 guard let i = remaining.firstIndex(where: { $0.seq == result.seq }) else { continue }
                 remaining.remove(at: i)
+                await progress.bump()
                 await onResult(result)
             case .done:
                 if remaining.isEmpty { return .completed }
@@ -273,7 +275,7 @@ actor TranslationQueue {
     }
 }
 
-/// Sliding deadline pushed forward on every result, so a large batch that is slow but
+/// Sliding deadline pushed forward on every accepted result, so a large batch that is slow but
 /// still answering is never mistaken for a stall.
 private actor StallDeadline {
     private let timeout: Duration

@@ -15,6 +15,8 @@ private enum FakeCall: Sendable {
     case hang
     /// Throw without answering.
     case fail
+    /// Keep yielding results for a seq nobody asked for, never answering the batch.
+    case strays(Duration)
 }
 
 private struct FakeError: Error, LocalizedError {
@@ -78,6 +80,12 @@ private struct FakeBackend: TranslationBackend {
                     return
                 case .fail:
                     cont.finish(throwing: FakeError())
+                    return
+                case .strays(let interval):
+                    while !Task.isCancelled {
+                        cont.yield(TranslationItem(seq: -1, text: "stray"))
+                        try? await Task.sleep(for: interval)
+                    }
                     return
                 }
                 for item in batch { cont.yield(TranslationItem(seq: item.seq, text: "t:\(item.text)")) }
@@ -196,6 +204,18 @@ struct TranslationWorkerTests {
             await waitUntil { recorder.results.count == 1 }
         }
         #expect(recorder.calls.map(\.generation) == [1])
+        #expect(recorder.results == [0: "t:s0"])
+        #expect(recorder.notices.count == 1)
+    }
+
+    /// Results that answer no pending chunk are not progress, so a backend that only
+    /// emits those is still treated as stalled and replaced.
+    @Test func strayResultsDoNotHoldOffTheStall() async {
+        let recorder = await runWorker(script: { generation, _ in generation == 0 ? .strays(.milliseconds(20)) : .answer }) { cont, recorder in
+            cont.yield(item(0))
+            await waitUntil { recorder.results.count == 1 }
+        }
+        #expect(recorder.calls.map(\.generation) == [0, 1])
         #expect(recorder.results == [0: "t:s0"])
         #expect(recorder.notices.count == 1)
     }
