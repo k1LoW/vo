@@ -96,11 +96,12 @@ private struct FakeBackend: TranslationBackend {
                     cont.finish(throwing: FakeError())
                     return
                 case .strays(let interval):
-                    while !Task.isCancelled {
-                        cont.yield(TranslationItem(seq: -1, text: "stray"))
+                    // This Task is not the one the worker cancels, so it watches for
+                    // the stream being torn down instead.
+                    while true {
+                        if case .terminated = cont.yield(TranslationItem(seq: -1, text: "stray")) { return }
                         try? await Task.sleep(for: interval)
                     }
-                    return
                 }
                 for item in batch { cont.yield(TranslationItem(seq: item.seq, text: "t:\(item.text)")) }
                 cont.finish()
