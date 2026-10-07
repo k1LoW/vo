@@ -29,6 +29,7 @@ private final class Recorder: Sendable {
         var notices: [String] = []
         var generations = 0
         var gateOpen = false
+        var workerDone = false
     }
 
     let state = Mutex(State())
@@ -45,8 +46,14 @@ private struct FakeBackend: TranslationBackend {
     let generation: Int
     let recorder: Recorder
     let script: @Sendable (_ generation: Int, _ seqs: [Int]) -> FakeCall
+    let prepareHangs: Bool
 
-    func prepare() async throws {}
+    func prepare() async throws {
+        if prepareHangs {
+            // Stops only once the worker cancels it, which it does after giving up.
+            while !Task.isCancelled { try? await Task.sleep(for: .seconds(60)) }
+        }
+    }
 
     func translate(_ batch: [TranslationItem]) -> AsyncThrowingStream<TranslationItem, Error> {
         let seqs = batch.map(\.seq)
@@ -81,12 +88,14 @@ private struct FakeBackend: TranslationBackend {
 }
 
 /// Polls until `condition` holds, failing the test instead of hanging if it never does.
-private func waitUntil(_ condition: () -> Bool) async {
+@discardableResult
+private func waitUntil(_ condition: () -> Bool) async -> Bool {
     for _ in 0..<400 {
-        if condition() { return }
+        if condition() { return true }
         try? await Task.sleep(for: .milliseconds(5))
     }
     Issue.record("condition not reached in time")
+    return false
 }
 
 /// Runs a worker with a short stall timeout. `feed` pushes chunks and drives the gate;
@@ -94,6 +103,7 @@ private func waitUntil(_ condition: () -> Bool) async {
 private func runWorker(
     maxBatch: Int = 16,
     maxStallAttempts: Int = 2,
+    prepareHangs: @escaping @Sendable (_ generation: Int) -> Bool = { _ in false },
     script: @escaping @Sendable (_ generation: Int, _ seqs: [Int]) -> FakeCall,
     feed: (AsyncStream<TranslationItem>.Continuation, Recorder) async -> Void
 ) async -> Recorder {
@@ -104,7 +114,7 @@ private func runWorker(
                 defer { s.generations += 1 }
                 return s.generations
             }
-            return FakeBackend(generation: generation, recorder: recorder, script: script)
+            return FakeBackend(generation: generation, recorder: recorder, script: script, prepareHangs: prepareHangs(generation))
         },
         onResult: { item in recorder.state.withLock { $0.results[item.seq] = item.text } },
         onNotice: { message in recorder.state.withLock { $0.notices.append(message) } },
@@ -113,10 +123,17 @@ private func runWorker(
         maxStallAttempts: maxStallAttempts
     )
     let (chunks, cont) = AsyncStream<TranslationItem>.makeStream()
-    let task = Task { await worker.run(chunks: chunks) }
+    let task = Task {
+        await worker.run(chunks: chunks)
+        recorder.state.withLock { $0.workerDone = true }
+    }
     await feed(cont, recorder)
     cont.finish()
-    await task.value
+    // Awaiting task.value directly would hang the whole suite if a regression left
+    // the worker stuck behind a fake that never answers.
+    if await !waitUntil({ recorder.state.withLock { $0.workerDone } }) {
+        task.cancel()
+    }
     return recorder
 }
 
@@ -168,6 +185,18 @@ struct TranslationWorkerTests {
         #expect(recorder.calls.map(\.generation) == [0, 1, 1])
         #expect(recorder.calls.map(\.seqs) == [[0], [0], [1, 2]])
         #expect(recorder.results == [0: "t:s0", 1: "t:s1", 2: "t:s2"])
+        #expect(recorder.notices.count == 1)
+    }
+
+    /// A backend whose warm-up never finishes is never translated on, so no translate
+    /// call overlaps the warm-up still running inside it.
+    @Test func backendWithStuckWarmUpIsReplaced() async {
+        let recorder = await runWorker(prepareHangs: { $0 == 0 }, script: { _, _ in .answer }) { cont, recorder in
+            cont.yield(item(0))
+            await waitUntil { recorder.results.count == 1 }
+        }
+        #expect(recorder.calls.map(\.generation) == [1])
+        #expect(recorder.results == [0: "t:s0"])
         #expect(recorder.notices.count == 1)
     }
 

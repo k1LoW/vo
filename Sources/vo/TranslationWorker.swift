@@ -63,8 +63,7 @@ struct TranslationWorker: Sendable {
     }
 
     private func loop(queue: TranslationQueue) async {
-        var backend = makeBackend()
-        guard await prepare(backend) else { return }
+        guard var backend = await makePreparedBackend() else { return }
         var retry: [TranslationItem] = []
         var stalls: [Int: Int] = [:]
 
@@ -95,8 +94,8 @@ struct TranslationWorker: Sendable {
                 }
             case .stalled(let remaining):
                 onNotice("vo: translation made no progress for \(seconds(stallTimeout))s. Restarting the translation session.")
-                backend = makeBackend()
-                guard await prepare(backend) else { return }
+                guard let fresh = await makePreparedBackend() else { return }
+                backend = fresh
                 for item in remaining {
                     let n = stalls[item.seq, default: 0] + 1
                     stalls[item.seq] = n
@@ -110,28 +109,52 @@ struct TranslationWorker: Sendable {
         }
     }
 
-    /// Warm the backend so the first chunk does not pay for lazy model loading.
-    /// Failure is non-fatal (translate surfaces real errors) and a hang is bounded
-    /// by `stallTimeout` the same way a translate call is. Returns false only when
-    /// the worker itself was cancelled, meaning shutdown started.
-    private func prepare(_ backend: any TranslationBackend) async -> Bool {
-        let (signal, cont) = AsyncStream<Void>.makeStream()
+    /// A new backend, warmed so the first chunk does not pay for lazy model loading.
+    /// Warm-up failure is non-fatal (translate surfaces real errors). A warm-up that
+    /// outlives `stallTimeout` is still running inside that backend, so translating on
+    /// it would overlap two calls on one session. That backend is dropped for a
+    /// second one used unwarmed, because warming that one too could wedge the same
+    /// way with no bound on retries, while its first translate is already bounded by
+    /// the stall watchdog. nil only when the worker itself was cancelled.
+    private func makePreparedBackend() async -> (any TranslationBackend)? {
+        let backend = makeBackend()
+        switch await prepare(backend) {
+        case .ready:
+            return backend
+        case .timedOut:
+            onNotice("vo: translation warm-up made no progress for \(seconds(stallTimeout))s. Restarting the translation session.")
+            return makeBackend()
+        case .cancelled:
+            return nil
+        }
+    }
+
+    private enum PrepareOutcome {
+        case ready
+        case timedOut
+        case cancelled
+    }
+
+    private func prepare(_ backend: any TranslationBackend) async -> PrepareOutcome {
+        let (signal, cont) = AsyncStream<PrepareOutcome>.makeStream()
         let preparing = Task {
             try? await backend.prepare()
-            cont.yield()
+            cont.yield(.ready)
         }
         let timer = Task {
             try? await Task.sleep(for: stallTimeout)
-            cont.yield()
+            cont.yield(.timedOut)
         }
-        for await _ in signal { break }
+        var outcome = PrepareOutcome.cancelled
+        for await first in signal {
+            outcome = first
+            break
+        }
         cont.finish()
         timer.cancel()
-        if Task.isCancelled {
-            preparing.cancel()
-            return false
-        }
-        return true
+        if Task.isCancelled { outcome = .cancelled }
+        if outcome != .ready { preparing.cancel() }
+        return outcome
     }
 
     private enum BatchOutcome {
