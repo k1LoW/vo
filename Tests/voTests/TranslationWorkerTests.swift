@@ -32,6 +32,8 @@ private final class Recorder: Sendable {
         var generations = 0
         var gateOpen = false
         var workerDone = false
+        var inFlight: [Int: Int] = [:]
+        var maxInFlight = 0
     }
 
     let state = Mutex(State())
@@ -40,6 +42,9 @@ private final class Recorder: Sendable {
     var results: [Int: String] { state.withLock { $0.results } }
     var notices: [String] { state.withLock { $0.notices } }
     var gateOpen: Bool { state.withLock { $0.gateOpen } }
+    /// Most calls ever open at once on a single backend. An abandoned call on a
+    /// replaced backend does not count against its successor.
+    var maxInFlight: Int { state.withLock { $0.maxInFlight } }
 
     func openGate() { state.withLock { $0.gateOpen = true } }
 }
@@ -59,10 +64,19 @@ private struct FakeBackend: TranslationBackend {
 
     func translate(_ batch: [TranslationItem]) -> AsyncThrowingStream<TranslationItem, Error> {
         let seqs = batch.map(\.seq)
-        recorder.state.withLock { $0.calls.append((generation, seqs)) }
+        let generation = generation
+        recorder.state.withLock { s in
+            s.calls.append((generation, seqs))
+            let open = s.inFlight[generation, default: 0] + 1
+            s.inFlight[generation] = open
+            s.maxInFlight = max(s.maxInFlight, open)
+        }
         let call = script(generation, seqs)
         let recorder = recorder
         return AsyncThrowingStream { cont in
+            cont.onTermination = { _ in
+                recorder.state.withLock { $0.inFlight[generation, default: 0] -= 1 }
+            }
             Task {
                 switch call {
                 case .answer:
@@ -159,9 +173,11 @@ struct TranslationWorkerTests {
             await waitUntil { recorder.calls.count == 1 }
             for seq in 1...4 { cont.yield(item(seq)) }
             try? await Task.sleep(for: .milliseconds(20))
+            #expect(recorder.calls.count == 1)
             recorder.openGate()
             await waitUntil { recorder.results.count == 5 }
         }
+        #expect(recorder.maxInFlight == 1)
         #expect(recorder.calls.map(\.seqs) == [[0], [1, 2, 3, 4]])
         #expect(recorder.results == [0: "t:s0", 1: "t:s1", 2: "t:s2", 3: "t:s3", 4: "t:s4"])
         #expect(recorder.notices.isEmpty)
@@ -177,6 +193,7 @@ struct TranslationWorkerTests {
             recorder.openGate()
             await waitUntil { recorder.results.count == 6 }
         }
+        #expect(recorder.maxInFlight == 1)
         #expect(recorder.calls.map(\.seqs) == [[0], [1, 2], [3, 4], [5]])
     }
 
@@ -190,6 +207,7 @@ struct TranslationWorkerTests {
             cont.yield(item(2))
             await waitUntil { recorder.results.count == 3 }
         }
+        #expect(recorder.maxInFlight == 1)
         #expect(recorder.calls.map(\.generation) == [0, 1, 1])
         #expect(recorder.calls.map(\.seqs) == [[0], [0], [1, 2]])
         #expect(recorder.results == [0: "t:s0", 1: "t:s1", 2: "t:s2"])
@@ -203,6 +221,7 @@ struct TranslationWorkerTests {
             cont.yield(item(0))
             await waitUntil { recorder.results.count == 1 }
         }
+        #expect(recorder.maxInFlight == 1)
         #expect(recorder.calls.map(\.generation) == [1])
         #expect(recorder.results == [0: "t:s0"])
         #expect(recorder.notices.count == 1)
@@ -215,6 +234,7 @@ struct TranslationWorkerTests {
             cont.yield(item(0))
             await waitUntil { recorder.results.count == 1 }
         }
+        #expect(recorder.maxInFlight == 1)
         #expect(recorder.calls.map(\.generation) == [0, 1])
         #expect(recorder.results == [0: "t:s0"])
         #expect(recorder.notices.count == 1)
@@ -228,6 +248,7 @@ struct TranslationWorkerTests {
             cont.yield(item(1))
             await waitUntil { recorder.results.count == 2 }
         }
+        #expect(recorder.maxInFlight == 1)
         #expect(recorder.results[0]?.hasPrefix("[translation failed:") == true)
         #expect(recorder.results[1] == "t:s1")
     }
@@ -243,6 +264,7 @@ struct TranslationWorkerTests {
             recorder.openGate()
             await waitUntil { recorder.results.count == 6 }
         }
+        #expect(recorder.maxInFlight == 1)
         #expect(recorder.calls.map(\.seqs) == [[0], [1, 2, 3, 4, 5]])
         #expect(recorder.notices.isEmpty)
     }
@@ -261,6 +283,7 @@ struct TranslationWorkerTests {
             recorder.openGate()
             await waitUntil { recorder.results.count == 4 }
         }
+        #expect(recorder.maxInFlight == 1)
         #expect(recorder.calls.map(\.seqs) == [[0], [1, 2, 3], [1], [2], [3]])
         #expect(recorder.results[1] == "t:s1")
         #expect(recorder.results[2] == "[translation failed: boom]")
