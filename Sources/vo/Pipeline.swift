@@ -1209,6 +1209,7 @@ struct Pipeline {
         await stops.register(AsyncStopper(action: stopper))
 
         let inputBuffers = perLocale.map { $0.inputBuffer }
+        let analyzers = perLocale.map { $0.analyzer }
 
         // Resampler: pull one buffer at a time from the file, bridge gaps with silence
         // exactly like runChannel does for live capture, and send into every bounded
@@ -1329,6 +1330,19 @@ struct Pipeline {
                             // not Unix epoch 00:00Z.
                             timestampFor: { audioStart in localEpoch.addingTimeInterval(audioStart ?? 0) }
                         )
+                    }
+                }
+                // The end of the input sequence does not end an analysis session, so
+                // without this the results streams above never close and the process
+                // never exits. Waiting on the resampler first means every buffer has
+                // been sent, so "through end of input" covers the whole file, and it
+                // also finalizes the trailing utterance that would otherwise stay
+                // volatile. A read failure ends the resampler too; finishing the
+                // session lets the drains return so the failure is rethrown below.
+                group.addTask { [analyzers] in
+                    _ = try? await resampler.value
+                    for analyzer in analyzers {
+                        try await analyzer.finalizeAndFinishThroughEndOfInput()
                     }
                 }
                 try await group.waitForAll()
