@@ -25,7 +25,8 @@ swift build -c release --arch arm64    # release
 Tests use Swift Testing (`import Testing`, `@Test`) in `Tests/voTests/`. They cover only the
 TCC-free pure logic: `StreamRenderer` JSONL output (source-order commit, volatile suppression,
 null-target on EOF), `VoError` messages, `detectRenderMode`, `RebindBox`, the `catchingNSException`
-bridge, and the `reopenBackoffDelay` schedule. The audio / Speech / Translation
+bridge, the `reopenBackoffDelay` schedule, and `TranslationWorker` (batching, stall recovery, and
+error narrowing against a fake backend). The audio / Speech / Translation
 paths require TCC grants and macOS 26 hardware, so they are not unit-tested.
 
 `scripts/test.sh` exists because on a Command Line Tools-only install (no full Xcode) the Swift
@@ -99,7 +100,7 @@ The whole pipeline is one TaskGroup orchestrating two parallel channels (mic + s
 |---|---|
 | `Vo.swift` | `@main` `AsyncParsableCommand`. Pure flag-parse and dispatch to either `runListen` or `runDoctor`. |
 | `Listen.swift` | Entry point for the main capture loop. Sets up `StreamRenderer`, `Pipeline`, SIGINT handler, banner, exit summary. |
-| `Pipeline.swift` | The TaskGroup orchestration. Spawns `runChannel(.mic, …)` and `runChannel(.speaker, …)` concurrently. Each channel constructs its own `SpeechTranscriber`, `SpeechAnalyzer`, and (if translating) `TranslationSession`. **Important: `TranslationSession` is a non-Sendable class; it is constructed inside the Task closure to avoid Sendable warnings — do not hoist it.** Also contains `convertBuffer` and `VoError`. |
+| `Pipeline.swift` | The TaskGroup orchestration. Spawns `runChannel(.mic, …)` and `runChannel(.speaker, …)` concurrently. Each channel constructs its own `SpeechTranscriber`, `SpeechAnalyzer`, and (if translating) `TranslationSession`. **Important: `TranslationSession` is a non-Sendable class; it is constructed inside the worker through `SessionTranslationBackend`, do not hoist it.** Also contains `convertBuffer` and `VoError`. |
 | `AudioSource.swift` | `MicCapture` (AVAudioEngine input node) and `SpeakerCapture` (Core Audio process tap: `CATapDescription` + `AudioHardwareCreateProcessTap`, mounted on a private aggregate device with an IOProc). Both expose `AsyncStream<AVAudioPCMBuffer>`. Includes the `AVAudioPCMBuffer.copy()` extension and `CoreAudioError`. |
 | `Renderer.swift` | `StreamRenderer` actor + `RenderEvent` + `ChunkTiming`. Owns the strict-order commit queue, the volatile live region, the TTY rendering, the JSONL emission, the wall-clock timestamp formatting, and the wrap-aware screen-row accounting. |
 | `Doctor.swift` | `runDoctor(json:)`. Gathers OS info, speech model status, translation language list, input device list via the helpers below, then renders human text or JSON. |
@@ -107,6 +108,7 @@ The whole pipeline is one TaskGroup orchestrating two parallel channels (mic + s
 | `Devices.swift` | `collectInputDevices()`. Direct Core Audio enumeration via `AudioObjectGetPropertyData`. |
 | `Responsibility.swift` | `Responsibility.reexecAsResponsibleProcess()`. Bridges the private `responsibility_spawnattrs_setdisclaim` and re-execs vo so TCC grants attach to vo rather than the terminal. Called unconditionally from `Listen.swift`, but gated on `hasEmbeddedInfoPlist()` (release builds only) and best-effort: returns and continues in-process on any failure. |
 | `NSExceptionBridge.swift` | `catchingNSException(_:)`. Wraps the `VoObjC` target's `@try` shim so a Cocoa API that reports failure by raising (`AVAudioNode.installTap` on a format mismatch) becomes a Swift error instead of an abort. The shim lives in `Sources/VoObjC` because Swift cannot catch an `NSException` at all. |
+| `TranslationWorker.swift` | `TranslationWorker`, which drives one `TranslationBackend` per (src → dst) pair with **exactly one call in flight**. Chunks that queue up while a call runs go out together in the next call (`translate(batch:)`, capped at `maxTranslationBatch`), so it translates one chunk at a time when keeping up and catches up in bulk when not. A call that yields no result for `translationStallTimeout` is abandoned (not awaited, since a wedged call may ignore cancellation), the session is rebuilt with a one-line stderr notice, and the unanswered chunks are retried one by one. A chunk in `maxTranslationStallAttempts` stalls, or one that throws on its own, becomes `[translation failed: …]` so the strict-order commit is never blocked for good. This replaced a fan-out of four concurrent `translate(_:)` calls on a shared session, after which a live session was seen to stop answering permanently. |
 | `SessionLog.swift` | Streaming JSONL transcript file. Two modes: explicit (`--transcript <path>` writes directly there) or temp (`TMPDIR` file moved/discarded on exit). Owns the overwrite-confirm and `Save transcript?` prompts. |
 
 ### Key invariants in `StreamRenderer`
