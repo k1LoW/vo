@@ -1339,8 +1339,19 @@ struct Pipeline {
                 // also finalizes the trailing utterance that would otherwise stay
                 // volatile. A read failure ends the resampler too; finishing the
                 // session lets the drains return so the failure is rethrown below.
-                group.addTask { [analyzers] in
-                    _ = try? await resampler.value
+                group.addTask { [analyzers, inputBuffers] in
+                    // When a drain throws, the group cancels this child and then waits
+                    // for it, so the catch below cannot run until it returns. Awaiting
+                    // an unstructured task's value is not cancelled with us, and a
+                    // resampler parked in a full buffer's `send` only wakes on
+                    // finish(), so unblock it here or the group waits forever.
+                    await withTaskCancellationHandler {
+                        _ = try? await resampler.value
+                    } onCancel: {
+                        resampler.cancel()
+                        Task { for buf in inputBuffers { await buf.finish() } }
+                    }
+                    try Task.checkCancellation()
                     for analyzer in analyzers {
                         try await analyzer.finalizeAndFinishThroughEndOfInput()
                     }
