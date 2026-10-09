@@ -68,8 +68,9 @@ enum Responsibility {
         // posix_spawn hands the child the calling thread's signal mask and ignored
         // dispositions. This runs from async code, so the calling thread is a
         // dispatch worker with SIGTERM and friends blocked, and the child would start
-        // with them blocked too: `kill <pid>` and the launcher's forwarding would
-        // never land. Start the child from a clean mask and default dispositions.
+        // with them blocked too. Then neither `kill <pid>` nor the launcher's
+        // forwarding would ever land. Start the child from a clean mask and default
+        // dispositions.
         var emptyMask = sigset_t()
         sigemptyset(&emptyMask)
         var defaulted = sigset_t()
