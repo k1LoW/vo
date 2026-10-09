@@ -1160,8 +1160,10 @@ struct Pipeline {
     ///   - end-to-end backpressure via pull-based `FileSource.nextBuffer()` plus a
     ///     `BoundedAnalyzerInputBuffer`. A push stream would let memory grow with file
     ///     duration when the disk feeds audio faster than the analyzer drains it.
-    ///   - the analyzer's input naturally finishes when the file hits EOF, which closes
-    ///     transcriber.results and lets this function return without external cancel.
+    ///   - the analyzer's input finishes when the file hits EOF, and the analysis
+    ///     session is then finished explicitly with `finalizeAndFinishThroughEndOfInput()`,
+    ///     which closes transcriber.results and lets this function return without
+    ///     external cancel. Closing the input alone leaves the session open.
     ///     A mid-stream read failure surfaces as a thrown VoError.inputFileReadFailed
     ///     via `try await resampler.value` at the end, instead of the silent truncation
     ///     a `break`-on-error feeder would produce.
@@ -1216,7 +1218,7 @@ struct Pipeline {
         // input. `send` suspends when any buffer is full, so file reads are paced by
         // the slowest analyzer's drain rate end-to-end. A read failure rethrows as
         // VoError.inputFileReadFailed; the success path closes the buffer cleanly so
-        // the analyzers' results streams drain and exit.
+        // the analyzers have consumed everything before the session is finished below.
         let resampler: Task<Void, Error> = Task.detached { [inputURL] in
             var fedEndHostTime: Double? = nil
             while !Task.isCancelled {
@@ -1381,8 +1383,8 @@ struct Pipeline {
         await reconciler.finish()
         for lane in lanes.values { lane.builder.finish() }
         for lane in lanes.values { await lane.translator.value }
-        // The analyzer's results finished because the resampler closed the input
-        // buffers. If the close was preceded by a read failure, that failure is still
+        // The analyzer's results finished because the session was finished once the
+        // resampler was done. If it stopped on a read failure, that failure is still
         // pending on the resampler's value; rethrow it here so a corrupt / truncated
         // file does not surface as a clean exit.
         try await resampler.value
