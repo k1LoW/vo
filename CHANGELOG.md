@@ -1,5 +1,14 @@
 # Changelog
 
+## [v0.10.0](https://github.com/k1LoW/vo/compare/v0.9.1...v0.10.0) - 2026-10-09
+
+### New Features 🎉
+- fix: recover from a translation session that stops answering by @k1LoW in https://github.com/k1LoW/vo/pull/50
+### Fix bug 🐛
+- fix: let vo --input exit once the file is done by @k1LoW in https://github.com/k1LoW/vo/pull/53
+### Dependency Updates ⬆️
+- chore(deps): bump Songmu/tagpr from 1.20.1 to 1.20.3 in the dependencies group by @dependabot[bot] in https://github.com/k1LoW/vo/pull/49
+
 ## [v0.9.1](https://github.com/k1LoW/vo/compare/v0.9.0...v0.9.1) - 2026-09-17
 
 ### Fix bug 🐛
