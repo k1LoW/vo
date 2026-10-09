@@ -65,6 +65,23 @@ enum Responsibility {
             warn("could not disclaim responsibility; continuing under the terminal's identity")
             return
         }
+        // posix_spawn hands the child the calling thread's signal mask and ignored
+        // dispositions. This runs from async code, so the calling thread is a
+        // dispatch worker with SIGTERM and friends blocked, and the child would start
+        // with them blocked too. Then neither `kill <pid>` nor the launcher's
+        // forwarding would ever land. Start the child from a clean mask and default
+        // dispositions.
+        var emptyMask = sigset_t()
+        sigemptyset(&emptyMask)
+        var defaulted = sigset_t()
+        sigfillset(&defaulted)
+        guard posix_spawnattr_setsigmask(&attr, &emptyMask) == 0,
+              posix_spawnattr_setsigdefault(&attr, &defaulted) == 0,
+              posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF)) == 0
+        else {
+            warn("could not reset signal state for its helper process; continuing under the terminal's identity")
+            return
+        }
 
         let argv: [UnsafeMutablePointer<CChar>?] =
             CommandLine.arguments.map { strdup($0) } + [nil]

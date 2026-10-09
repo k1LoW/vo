@@ -456,6 +456,10 @@ final class FileSource: @unchecked Sendable {
         let isStopped = stopped
         lock.unlock()
         if isStopped { return nil }
+        // AVAudioFile.read throws rather than returning an empty buffer once the
+        // position reaches the end, so a clean EOF has to be detected up front or it
+        // would surface as inputFileReadFailed.
+        if file.framePosition >= file.length { return nil }
         guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { return nil }
         try file.read(into: buf, frameCount: chunkFrames)
         if buf.frameLength == 0 { return nil }

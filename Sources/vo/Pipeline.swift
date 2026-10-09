@@ -1160,8 +1160,10 @@ struct Pipeline {
     ///   - end-to-end backpressure via pull-based `FileSource.nextBuffer()` plus a
     ///     `BoundedAnalyzerInputBuffer`. A push stream would let memory grow with file
     ///     duration when the disk feeds audio faster than the analyzer drains it.
-    ///   - the analyzer's input naturally finishes when the file hits EOF, which closes
-    ///     transcriber.results and lets this function return without external cancel.
+    ///   - the analyzer's input finishes when the file hits EOF, and the analysis
+    ///     session is then finished explicitly with `finalizeAndFinishThroughEndOfInput()`,
+    ///     which closes transcriber.results and lets this function return without
+    ///     external cancel. Closing the input alone leaves the session open.
     ///     A mid-stream read failure surfaces as a thrown VoError.inputFileReadFailed
     ///     via `try await resampler.value` at the end, instead of the silent truncation
     ///     a `break`-on-error feeder would produce.
@@ -1209,13 +1211,14 @@ struct Pipeline {
         await stops.register(AsyncStopper(action: stopper))
 
         let inputBuffers = perLocale.map { $0.inputBuffer }
+        let analyzers = perLocale.map { $0.analyzer }
 
         // Resampler: pull one buffer at a time from the file, bridge gaps with silence
         // exactly like runChannel does for live capture, and send into every bounded
         // input. `send` suspends when any buffer is full, so file reads are paced by
         // the slowest analyzer's drain rate end-to-end. A read failure rethrows as
         // VoError.inputFileReadFailed; the success path closes the buffer cleanly so
-        // the analyzers' results streams drain and exit.
+        // the analyzers have consumed everything before the session is finished below.
         let resampler: Task<Void, Error> = Task.detached { [inputURL] in
             var fedEndHostTime: Double? = nil
             while !Task.isCancelled {
@@ -1331,6 +1334,30 @@ struct Pipeline {
                         )
                     }
                 }
+                // The end of the input sequence does not end an analysis session, so
+                // without this the results streams above never close and the process
+                // never exits. Waiting on the resampler first means every buffer has
+                // been sent, so "through end of input" covers the whole file, and it
+                // also finalizes the trailing utterance that would otherwise stay
+                // volatile. A read failure ends the resampler too; finishing the
+                // session lets the drains return so the failure is rethrown below.
+                group.addTask { [analyzers, inputBuffers] in
+                    // When a drain throws, the group cancels this child and then waits
+                    // for it, so the catch below cannot run until it returns. Awaiting
+                    // an unstructured task's value is not cancelled with us, and a
+                    // resampler parked in a full buffer's `send` only wakes on
+                    // finish(), so unblock it here or the group waits forever.
+                    await withTaskCancellationHandler {
+                        _ = try? await resampler.value
+                    } onCancel: {
+                        resampler.cancel()
+                        Task { for buf in inputBuffers { await buf.finish() } }
+                    }
+                    try Task.checkCancellation()
+                    for analyzer in analyzers {
+                        try await analyzer.finalizeAndFinishThroughEndOfInput()
+                    }
+                }
                 try await group.waitForAll()
             }
         } catch {
@@ -1356,8 +1383,8 @@ struct Pipeline {
         await reconciler.finish()
         for lane in lanes.values { lane.builder.finish() }
         for lane in lanes.values { await lane.translator.value }
-        // The analyzer's results finished because the resampler closed the input
-        // buffers. If the close was preceded by a read failure, that failure is still
+        // The analyzer's results finished because the session was finished once the
+        // resampler was done. If it stopped on a read failure, that failure is still
         // pending on the resampler's value; rethrow it here so a corrupt / truncated
         // file does not surface as a clean exit.
         try await resampler.value
