@@ -153,4 +153,24 @@ struct VoErrorTests {
         #expect(msg.contains("microphone input device"))
         #expect(msg.contains("format mismatch"))
     }
+
+    /// FoundationModels availability error names the reason and points to System Settings / doctor.
+    @Test func foundationModelNotAvailableNamesReasonAndSettings() {
+        let err = VoError.foundationModelNotAvailable(reason: "Apple Intelligence is turned off.")
+        let msg = err.description
+
+        #expect(msg.contains("Apple Intelligence"))
+        #expect(msg.contains("Apple Intelligence is turned off."))
+        #expect(msg.contains("System Settings"))
+        #expect(msg.contains("--doctor"))
+    }
+
+    /// Summarization failure includes the specific failure reason.
+    @Test func summarizationFailedIncludesReason() {
+        let err = VoError.summarizationFailed(reason: "Context window exceeded")
+        let msg = err.description
+
+        #expect(msg.contains("Failed to generate summary"))
+        #expect(msg.contains("Context window exceeded"))
+    }
 }

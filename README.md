@@ -16,6 +16,7 @@ https://github.com/user-attachments/assets/6c11b6bc-395f-4593-8eca-856c4e7fbc93
 - Wall-clock timestamps and audio time range per chunk
 - Transcription confidence per chunk (mean + min) in JSONL output
 - Optional voice processing (echo cancellation + noise reduction)
+- On-device summarization via Apple Intelligence Foundation Models ([`SystemLanguageModel`](https://developer.apple.com/documentation/foundationmodels/systemlanguagemodel)) with `--summary`
 - Environment diagnostics via `--doctor`
 
 ## Install
@@ -51,6 +52,9 @@ $ vo --src en-US --dst ja-JP          # Transcribe and translate
 $ vo --no-speaker                     # Mic only
 $ vo --no-mic --src en-US --dst ja-JP # Speaker only, with translation
 $ vo --input meeting.m4a              # Transcribe an on-disk audio file instead
+$ vo --summary                        # Transcribe and generate on-device summary at exit
+$ vo --summary min.md                 # Save summary directly to Markdown
+$ vo --summary min.md --summary-prompt "Extract decisions, action items, and key discussion points." # Meeting minutes
 $ vo --select-device                  # Pick & pin the mic / speaker at startup
 $ vo --json | jq                      # JSONL output for piping
 $ vo --doctor                         # Environment diagnostics
@@ -159,6 +163,8 @@ $ vo --src en-US,ja-JP                     # transcribe-only, language auto-pick
 | `--input <path>` | (none) | Transcribe an on-disk audio file instead of live mic / speaker. Mutually exclusive with `--no-mic` / `--no-speaker` / `--voice-processing` / `--select-device` |
 | `--json` | | Force JSONL output |
 | `--transcript <path>` | (none; prompts at exit in TTY) | Stream finalized chunks as JSONL to `<path>` incrementally. Skips the interactive save prompt |
+| `--summary [path]` | (none) | Generate on-device AI summary at exit using Apple Intelligence Foundation Models. Optionally save to `<path>` (Markdown) |
+| `--summary-prompt <prompt>` | (none) | Custom prompt or instructions for the AI summary |
 | `--doctor` | | Print full environment diagnostics and exit |
 
 `vo --doctor` lists supported locales, installed speech models, available translation languages, and audio input devices. Run it first if something behaves unexpectedly.

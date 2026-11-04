@@ -1,5 +1,6 @@
 import ArgumentParser
 import Foundation
+import FoundationModels
 
 struct DoctorReport: Sendable {
     let osVersion: String
@@ -8,6 +9,8 @@ struct DoctorReport: Sendable {
     let speechLocales: [SpeechLocaleInfo]
     let translationLanguages: [String]
     let inputDevices: [AudioDeviceInfo]
+    let foundationModelsAvailable: Bool
+    let foundationModelsReason: String?
 }
 
 /// Print a full environment report: OS, speech models, translation languages, audio devices.
@@ -33,6 +36,7 @@ private func gatherDoctorReport() async -> DoctorReport {
     let speech = await collectSpeechLocales()
     let translation = await collectTranslationLanguages()
     let devices = (try? collectInputDevices()) ?? []
+    let fmStatus = Summarizer.availabilityStatus()
 
     return DoctorReport(
         osVersion: osStr,
@@ -40,7 +44,9 @@ private func gatherDoctorReport() async -> DoctorReport {
         hostname: ProcessInfo.processInfo.hostName,
         speechLocales: speech,
         translationLanguages: translation,
-        inputDevices: devices
+        inputDevices: devices,
+        foundationModelsAvailable: fmStatus.available,
+        foundationModelsReason: fmStatus.reason
     )
 }
 
@@ -68,6 +74,13 @@ private func printDoctorText(_ r: DoctorReport) {
     section("Translation")
     ok("\(r.translationLanguages.count) languages available on this device")
     print("    \(r.translationLanguages.joined(separator: ", "))")
+
+    section("Foundation Models (Apple Intelligence)")
+    if r.foundationModelsAvailable {
+        ok("Foundation Models available on this device (ready for --summary)")
+    } else {
+        warn("Foundation Models unavailable: \(r.foundationModelsReason ?? "Unknown reason")")
+    }
 
     section("Input devices")
     if r.inputDevices.isEmpty {
@@ -99,6 +112,13 @@ private func printDoctorText(_ r: DoctorReport) {
 // MARK: - JSON output
 
 private func printDoctorJSON(_ r: DoctorReport) throws {
+    var foundationModelsPayload: [String: Any] = [
+        "available": r.foundationModelsAvailable
+    ]
+    if let reason = r.foundationModelsReason {
+        foundationModelsPayload["reason"] = reason
+    }
+
     let payload: [String: Any] = [
         "system": [
             "os": r.osVersion,
@@ -115,6 +135,7 @@ private func printDoctorJSON(_ r: DoctorReport) throws {
         "translation": [
             "languages": r.translationLanguages
         ] as [String: Any],
+        "foundationModels": foundationModelsPayload,
         "devices": r.inputDevices.map { d -> [String: Any] in
             [
                 "id": Int(d.id),

@@ -13,7 +13,10 @@ func runListen(
     voiceProcessing: Bool,
     selectDevice: Bool,
     input: String?,
-    transcript: String?
+    transcript: String?,
+    summary: Bool = false,
+    summaryOut: String? = nil,
+    summaryPrompt: String? = nil
 ) async throws {
     let inputURL: URL?
     if let input {
@@ -31,6 +34,24 @@ func runListen(
         inputURL = nil
         guard mic || speaker else {
             throw ValidationError("Cannot disable both mic and speaker. Drop one of --no-mic / --no-speaker.")
+        }
+    }
+
+    if summary {
+        // Fail-fast if Apple Intelligence / Foundation Models is unavailable before capturing starts
+        try Summarizer.checkAvailability()
+        if let summaryOut {
+            let resolvedSummary = (summaryOut as NSString).expandingTildeInPath
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: resolvedSummary, isDirectory: &isDir), isDir.boolValue {
+                throw ValidationError("Cannot write summary to \(resolvedSummary): path is a directory.")
+            }
+            let parentDir = (resolvedSummary as NSString).deletingLastPathComponent
+            let effectiveParent = parentDir.isEmpty ? "." : parentDir
+            var isParentDir: ObjCBool = false
+            if !FileManager.default.fileExists(atPath: effectiveParent, isDirectory: &isParentDir) || !isParentDir.boolValue {
+                throw ValidationError("Cannot write summary to \(resolvedSummary): parent directory does not exist.")
+            }
         }
     }
 
@@ -78,14 +99,16 @@ func runListen(
     let mode = detectRenderMode(jsonForced: json)
     let isTTY = (mode == .tty)
 
+    let isSummaryView = isTTY && summary
+
     // Stream JSONL to disk as utterances finalize, so memory stays bounded for long
     // sessions. With --transcript we write straight to the user-specified path.
     // Without it, we use a temp file and decide at shutdown whether to keep or
     // discard. If the session can do neither (no --transcript AND no save prompt —
-    // e.g. piped JSONL run), skip the temp file entirely so we don't burn disk I/O
-    // writing bytes we know we are about to discard, and don't leave a large temp
-    // behind on a SIGKILL.
-    let canSaveTranscript = transcript != nil || (isTTY && canPromptForLog())
+    // e.g. piped JSONL run or summary view), skip the temp file entirely so we don't
+    // burn disk I/O writing bytes we know we are about to discard, and don't leave a
+    // large temp behind on a SIGKILL.
+    let canSaveTranscript = transcript != nil || (isTTY && !isSummaryView && canPromptForLog())
     let sessionLog: SessionLog? = canSaveTranscript ? try SessionLog.open(explicitPath: transcript) : nil
 
     // If we throw out of this function before finalizeSession runs (e.g. the pipeline
@@ -107,14 +130,31 @@ func runListen(
     // single-channel live modes (--no-mic / --no-speaker) suppress [mic] / [spk].
     let showChannelLabel = inputURL == nil && mic && speaker
 
+    let effectiveSummaryLocales = targetLocales ?? sourceLocales
+    let uniqueLangNames = Set(effectiveSummaryLocales.map { Summarizer.languageDisplayName(for: $0) })
+    let targetLanguageName: String? = (uniqueLangNames.count == 1) ? uniqueLangNames.first : nil
+    let summarizer: Summarizer? = summary ? Summarizer(
+        summaryOut: summaryOut,
+        customPrompt: summaryPrompt,
+        targetLanguage: targetLanguageName
+    ) : nil
+
     let renderer = StreamRenderer(
         mode: mode,
         sourceLang: primarySource.identifier(.bcp47),
         targetLang: primaryTarget?.identifier(.bcp47) ?? "",
         translationEnabled: targetLocales != nil,
         showChannelLabel: showChannelLabel,
-        logSink: sessionLog
+        logSink: sessionLog,
+        summarizer: summarizer,
+        isSummaryView: isSummaryView
     )
+
+    if let summarizer, isSummaryView {
+        await summarizer.setOnAppendChunk { [weak renderer] chunk in
+            await renderer?.appendSummaryChunk(chunk)
+        }
+    }
 
     let pipeline = Pipeline(
         sourceLocales: sourceLocales,
@@ -147,6 +187,9 @@ func runListen(
                 speakerDevice: deviceLabels.speaker
             )
         }
+        if isSummaryView {
+            await renderer.renderInitialSummaryView()
+        }
     }
 
     // pipeline.cancel() lets pipeline.run() below return, so after SIGINT the natural
@@ -175,7 +218,9 @@ func runListen(
                 sessionLog: sessionLog,
                 isTTY: isTTY,
                 count: count,
-                duration: Date().timeIntervalSince(startedAt)
+                duration: Date().timeIntervalSince(startedAt),
+                summarizer: summarizer,
+                isSummaryView: isSummaryView
             )
             Foundation.exit(0)
         }
@@ -191,7 +236,9 @@ func runListen(
             sessionLog: sessionLog,
             isTTY: isTTY,
             count: count,
-            duration: Date().timeIntervalSince(startedAt)
+            duration: Date().timeIntervalSince(startedAt),
+            summarizer: summarizer,
+            isSummaryView: isSummaryView
         )
     } else {
         // The SIGINT handler claimed finalization and will exit the process.
@@ -225,22 +272,80 @@ private func finalizeSession(
     sessionLog: SessionLog?,
     isTTY: Bool,
     count: Int,
-    duration: TimeInterval
+    duration: TimeInterval,
+    summarizer: Summarizer?,
+    isSummaryView: Bool = false
 ) async {
     if let sessionLog {
         // Gate the save prompt on isTTY (renderer mode), not just on canPromptForLog().
-        // Otherwise `vo --json` run from an interactive shell — where STDIN and STDOUT
-        // are both TTYs but the renderer is emitting machine-readable JSONL — would
-        // interleave the prompt text into the JSONL stream and corrupt it.
-        let status = resolveSessionLog(sessionLog: sessionLog, canPrompt: isTTY && canPromptForLog())
-        if isTTY {
+        // When in isSummaryView, don't show the interactive prompt on STDOUT to preserve
+        // the clean live summary view.
+        let canPrompt = isTTY && !isSummaryView && canPromptForLog()
+        let status = resolveSessionLog(sessionLog: sessionLog, canPrompt: canPrompt)
+        if isTTY && !isSummaryView {
             if let status { print(status) }
         } else if let status, sessionLog.isExplicit {
             FileHandle.standardError.write(Data((status + "\n").utf8))
         }
     }
-    if isTTY {
+    if isTTY && summarizer == nil {
         printSummary(count: count, duration: duration)
+    }
+
+    // Finalize AI summarization if enabled
+    if let summarizer {
+        let totalCount = await summarizer.utteranceCount
+        if count == 0 && totalCount == 0 {
+            if isTTY {
+                print("\u{001B}[38;5;244m(No utterances captured; skipping summary)\u{001B}[0m")
+                printSummary(count: count, duration: duration)
+            }
+            return
+        }
+
+        let notice = "Finalizing summary with Apple Intelligence..."
+        if isTTY {
+            print("\n\u{001B}[38;5;244m\(notice)\u{001B}[0m")
+        } else {
+            FileHandle.standardError.write(Data((notice + "\n").utf8))
+        }
+
+        do {
+            let summaryMarkdown = try await summarizer.finalize()
+
+            let summaryOut = summarizer.summaryOut
+            if isTTY {
+                print("\n\u{001B}[1;36mvo\u{001B}[0m \u{001B}[1m• Final Summary (Apple Intelligence)\u{001B}[0m")
+                print("\u{001B}[38;5;240m" + String(repeating: "─", count: 70) + "\u{001B}[0m\n")
+                print(summaryMarkdown)
+                print("\n\u{001B}[38;5;240m" + String(repeating: "─", count: 70) + "\u{001B}[0m")
+                printSummary(count: count, duration: duration)
+                if let summaryOut {
+                    let resolved = (summaryOut as NSString).expandingTildeInPath
+                    print("Saved summary: \(resolved)")
+                }
+            } else if let summaryOut {
+                let resolved = (summaryOut as NSString).expandingTildeInPath
+                let msg = "Saved summary: \(resolved)"
+                FileHandle.standardError.write(Data((msg + "\n").utf8))
+            } else {
+                let summaryObj: [String: Any] = [
+                    "type": "summary",
+                    "content": summaryMarkdown
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: summaryObj),
+                   let jsonString = String(data: data, encoding: .utf8) {
+                    print(jsonString)
+                }
+            }
+        } catch {
+            let errorMsg = (error as? VoError)?.description ?? "Failed to generate summary: \(error.localizedDescription)"
+            if isTTY {
+                print("\u{001B}[31m\(errorMsg)\u{001B}[0m")
+            } else {
+                FileHandle.standardError.write(Data((errorMsg + "\n").utf8))
+            }
+        }
     }
 }
 

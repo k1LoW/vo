@@ -1661,11 +1661,22 @@ enum VoError: Error, CustomStringConvertible {
     case inputFileReadFailed(url: URL, underlying: Error)
     case audioDeviceNotReady(channel: AudioChannel, format: String)
     case audioTapInstallFailed(channel: AudioChannel, underlying: Error)
+    case foundationModelNotAvailable(reason: String)
+    case summarizationFailed(reason: String)
 
     var description: String {
         switch self {
         case .noCompatibleAudioFormat:
             return "No audio format compatible with SpeechTranscriber is available on this device."
+
+        case .foundationModelNotAvailable(let reason):
+            return """
+            Foundation Models (Apple Intelligence) is not available: \(reason)
+            Check System Settings > Apple Intelligence & Siri. (Run `vo --doctor` for diagnostics.)
+            """
+
+        case .summarizationFailed(let reason):
+            return "Failed to generate summary: \(reason)"
 
         case .audioDeviceNotReady(let channel, let format):
             return """
