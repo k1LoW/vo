@@ -208,6 +208,34 @@ struct SummarizerTests {
         #expect(await summarizer.partialSummaries.isEmpty)
     }
 
+    @Test func shortSessionKeepsWholeTranscriptBeyondFallbackCharBudget() async throws {
+        actor CallRecorder {
+            var prompts: [String] = []
+            func record(_ p: String) { prompts.append(p) }
+        }
+        let recorder = CallRecorder()
+        let summarizer = Summarizer(
+            summaryOut: nil,
+            customPrompt: nil,
+            responder: { prompt in
+                await recorder.record(prompt)
+                return "# Final Summary"
+            }
+        )
+
+        let filler = String(repeating: "x", count: 150)
+        for i in 1...20 {
+            await summarizer.append(Summarizer.TranscriptLine(timestamp: "10:00:00", channel: "mic", text: "Utterance \(i) \(filler)"))
+        }
+
+        _ = try await summarizer.finalize()
+        let prompts = await recorder.prompts
+
+        #expect(prompts.count == 1)
+        #expect(prompts[0].contains("Utterance 1 "))
+        #expect(prompts[0].contains("Utterance 20 "))
+    }
+
     @Test func longBacklogBatchesIntoChunksOfAtMost25Lines() async throws {
         let lines = (1...60).map { i in
             Summarizer.TranscriptLine(timestamp: "10:00:00", channel: "mic", text: "Utterance \(i)")

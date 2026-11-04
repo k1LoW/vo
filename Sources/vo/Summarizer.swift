@@ -216,6 +216,10 @@ actor Summarizer {
         // For a short session (partialSummaries.isEmpty && pendingLines.count <= updateChunkThreshold),
         // skip the intermediate chunk step so we summarize the raw transcript directly in one LLM call.
         var unmappedLines: [TranscriptLine] = []
+        // Kept apart from unmappedLines so the short-session transcript is not cut by
+        // boundedFallbackLines. It is at most one Map batch, which every chunk call already
+        // sends whole, and trimming it would silently drop the start of a short meeting.
+        var directLines: [TranscriptLine] = []
         if !partialSummaries.isEmpty || pendingLines.count > updateChunkThreshold {
             while !pendingLines.isEmpty {
                 let batchCount = min(pendingLines.count, updateChunkThreshold)
@@ -258,11 +262,11 @@ actor Summarizer {
                 }
             }
         } else {
-            unmappedLines = pendingLines
+            directLines = pendingLines
             pendingLines.removeAll()
         }
 
-        if partialSummaries.isEmpty && unmappedLines.isEmpty {
+        if partialSummaries.isEmpty && unmappedLines.isEmpty && directLines.isEmpty {
             return "No transcript content was captured to summarize."
         }
 
@@ -270,8 +274,8 @@ actor Summarizer {
         let prompt: String
 
         if partialSummaries.isEmpty {
-            let tail = Self.boundedFallbackLines(from: unmappedLines)
-            let formatted = Self.formatTranscript(tail)
+            let lines = directLines.isEmpty ? Self.boundedFallbackLines(from: unmappedLines) : directLines
+            let formatted = Self.formatTranscript(lines)
             prompt = SummaryPrompts.finalPrompt(
                 transcript: formatted,
                 isIntermediateSummary: false,
