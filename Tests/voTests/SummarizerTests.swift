@@ -208,6 +208,68 @@ struct SummarizerTests {
         #expect(await summarizer.partialSummaries.isEmpty)
     }
 
+    @Test func shortSessionKeepsWholeTranscriptBeyondFallbackCharBudget() async throws {
+        actor CallRecorder {
+            var prompts: [String] = []
+            func record(_ p: String) { prompts.append(p) }
+        }
+        let recorder = CallRecorder()
+        let summarizer = Summarizer(
+            summaryOut: nil,
+            customPrompt: nil,
+            responder: { prompt in
+                await recorder.record(prompt)
+                return "# Final Summary"
+            }
+        )
+
+        let filler = String(repeating: "x", count: 150)
+        for i in 1...20 {
+            await summarizer.append(Summarizer.TranscriptLine(timestamp: "10:00:00", channel: "mic", text: "Utterance \(i) \(filler)"))
+        }
+
+        _ = try await summarizer.finalize()
+        let prompts = await recorder.prompts
+
+        #expect(prompts.count == 1)
+        #expect(prompts[0].contains("Utterance 1 "))
+        #expect(prompts[0].contains("Utterance 20 "))
+    }
+
+    @Test func requeuedFailedBatchStaysBoundedInShortSessionFinalize() async throws {
+        actor CallRecorder {
+            var finalPrompts: [String] = []
+            func record(_ p: String) { finalPrompts.append(p) }
+        }
+        let recorder = CallRecorder()
+        let summarizer = Summarizer(
+            summaryOut: nil,
+            customPrompt: nil,
+            onNotice: { _ in },
+            responder: { prompt in
+                if prompt.contains("The following is part") {
+                    throw VoError.summarizationFailed(reason: "context window exceeded")
+                }
+                await recorder.record(prompt)
+                return "# Final Summary"
+            }
+        )
+
+        // 25 lines trigger one background Map call, which fails once and is requeued
+        // (maxChunkAttempts defaults to 2), leaving a short session with a failed batch.
+        let filler = String(repeating: "x", count: 150)
+        for i in 1...25 {
+            await summarizer.append(Summarizer.TranscriptLine(timestamp: "10:00:00", channel: "mic", text: "Utterance \(i) \(filler)"))
+        }
+
+        _ = try await summarizer.finalize()
+        let finalPrompts = await recorder.finalPrompts
+
+        #expect(finalPrompts.count == 1)
+        #expect(!finalPrompts[0].contains("Utterance 1 "))
+        #expect(finalPrompts[0].contains("Utterance 25 "))
+    }
+
     @Test func longBacklogBatchesIntoChunksOfAtMost25Lines() async throws {
         let lines = (1...60).map { i in
             Summarizer.TranscriptLine(timestamp: "10:00:00", channel: "mic", text: "Utterance \(i)")
