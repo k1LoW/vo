@@ -1,5 +1,14 @@
 # Changelog
 
+## [v0.11.0](https://github.com/k1LoW/vo/compare/v0.10.0...v0.11.0) - 2026-11-04
+
+### New Features 🎉
+- feat: add on-device summarization using Apple Intelligence Foundation Models by @kromiii in https://github.com/k1LoW/vo/pull/55
+### Dependency Updates ⬆️
+- chore(deps): bump Songmu/tagpr from 1.20.3 to 1.21.2 in the dependencies group by @dependabot[bot] in https://github.com/k1LoW/vo/pull/54
+### Other Changes
+- fix: keep the whole transcript when a short session skips the Map step by @k1LoW in https://github.com/k1LoW/vo/pull/57
+
 ## [v0.10.0](https://github.com/k1LoW/vo/compare/v0.9.1...v0.10.0) - 2026-10-09
 
 ### New Features 🎉
